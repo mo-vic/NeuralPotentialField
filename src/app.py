@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QTimer
 from PyQt5.QtCore import QPointF
 from PyQt5.QtCore import pyqtSignal
 
@@ -24,7 +25,10 @@ from PyQt5.QtWidgets import QGraphicsPolygonItem, QGraphicsLineItem, QGraphicsEl
 from PyQt5.QtWidgets import QApplication
 
 import torch
+from torch import nn
+from torch.optim import SGD
 from torch.backends import cudnn
+from torch.autograd import Variable
 
 from train_collision_detection_network import CollisionDetectionNetwork
 
@@ -58,7 +62,7 @@ origin -= origin
 
 class GraphicsScene(QGraphicsScene):
     IKResultUpdated = pyqtSignal(str)
-    ConfigurationUpdated = pyqtSignal(float, float)
+    goalStateUpdated = pyqtSignal(float, float)
 
     def __init__(self, parent=None, radius=6, width=4):
         super(GraphicsScene, self).__init__(parent=parent)
@@ -223,9 +227,8 @@ class GraphicsScene(QGraphicsScene):
             inCollision = self.update_theta(theta1 / np.pi * 180, theta2 / np.pi * 180)
             valid = not inCollision
 
-            self.ConfigurationUpdated.emit(theta1, theta2)
-
             if valid:
+                self.goalStateUpdated.emit(theta1, theta2)
                 break
 
         if not valid:
@@ -264,7 +267,8 @@ class GraphicsScene(QGraphicsScene):
 
 
 class CentralWidget(QWidget):
-    def __init__(self, ckpt_path, use_gpu, min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height):
+    def __init__(self, ckpt_path, use_gpu, min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height,
+                 xi, eta, zeta, sigma, s, epsilon, delta, N, lr, momentum):
         super(CentralWidget, self).__init__()
 
         model = CollisionDetectionNetwork(input_shape=(1, 4))
@@ -278,11 +282,56 @@ class CentralWidget(QWidget):
             model = torch.nn.DataParallel(model)
         self.model = model
 
+        mid_bbox_width = (min_bbox_width + max_bbox_width) / 2.0
+        mid_bbox_height = (min_bbox_height + max_bbox_height) / 2.0
+        if use_gpu:
+            self.bbox_info = torch.tensor([[mid_bbox_width, mid_bbox_height]], dtype=torch.float32).cuda()
+        else:
+            self.bbox_info = torch.tensor([[mid_bbox_width, mid_bbox_height]], dtype=torch.float32)
+
         self.use_gpu = use_gpu
         self.min_bbox_width = min_bbox_width
         self.max_bbox_width = max_bbox_width
         self.min_bbox_height = min_bbox_height
         self.max_bbox_height = max_bbox_height
+
+        self.xi = xi
+        self.eta = eta
+        self.zeta = zeta
+        self.sigma = sigma
+        self.s = s
+        self.epsilon = epsilon
+        self.delta = delta
+        self.N = N
+
+        self.counter = 0
+        self.timer = QTimer()
+        self.timer.setInterval(0)
+        self.timer.timeout.connect(self.one_step)
+
+        q_current = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        q_goal = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+
+        if use_gpu:
+            self.q_current = Variable(q_current).cuda()
+            self.q_goal = q_goal.cuda()
+        else:
+            self.q_current = Variable(q_current)
+            self.q_goal = q_goal
+        self.q_current.requires_grad_(True)
+
+        self.vrep = None
+        self.q_prev = torch.zeros_like(self.q_current.data.detach())
+        self.q_prev.copy_(self.q_current.data.detach())
+
+        self.optimizer = SGD([self.q_current], lr=lr, momentum=momentum)
+        self.mse = nn.MSELoss()
+        self.xent = nn.BCELoss()
+        if use_gpu:
+            target = torch.tensor([[0.0]], dtype=torch.float32).cuda()
+        else:
+            target = torch.tensor([[0.0]], dtype=torch.float32)
+        self.target = target
 
         # generate probability map
         width = (self.min_bbox_width + self.max_bbox_width) / 2.0
@@ -372,23 +421,73 @@ class CentralWidget(QWidget):
         self.update_theta()
         self.update_bbox()
 
-        self.scene.ConfigurationUpdated.connect(self.update_slider)
+        self.scene.goalStateUpdated.connect(self.start_npf)
+
+    def update_q_current(self, value):
+        theta1 = self.q_current.data[0, 0].item()
+        theta2 = self.q_current.data[0, 1].item()
+
+        if "theta1" in value:
+            theta1 = value["theta1"] / 180 * np.pi
+        elif "theta2" in value:
+            theta2 = value["theta2"] / 180 * np.pi
+
+        q_current = torch.tensor([[theta1, theta2]], dtype=torch.float32)
+        if use_gpu:
+            self.q_current.data = q_current.cuda()
+        else:
+            self.q_current.data = q_current
+
+    def update_q_goal(self, theta1, theta2):
+        if use_gpu:
+            self.q_goal = torch.tensor([[theta1, theta2]], dtype=torch.float32).cuda()
+        else:
+            self.q_goal = torch.tensor([[theta1, theta2]], dtype=torch.float32)
+
+    def update_bbox_info(self, value):
+        bbox_width = self.bbox_info[0, 0].item()
+        bbox_height = self.bbox_info[0, 1].item()
+
+        if "width" in value:
+            bbox_width = value["width"]
+        elif "height" in value:
+            bbox_height = value["height"]
+
+        if use_gpu:
+            self.bbox_info = torch.tensor([[bbox_width, bbox_height]], dtype=torch.float32).cuda()
+        else:
+            self.bbox_info = torch.tensor([[bbox_width, bbox_height]], dtype=torch.float32)
+
+    def start_npf(self, theta1, theta2):
+        self.update_q_goal(theta1, theta2)
+
+        self.counter = 0
+        self.vrep = None
+        self.timer.start()
 
     def update_theta1(self, value):
         self.theta1_label.setText("theta1=%d" % value)
         self.update_theta()
 
+        self.update_q_current({"theta1": value})
+
     def update_theta2(self, value):
         self.theta2_label.setText("theta2=%d" % value)
         self.update_theta()
+
+        self.update_q_current({"theta2": value})
 
     def update_bbox_width(self, value):
         self.bbox_width_label.setText("bbox width=%d" % value)
         self.update_bbox()
 
+        self.update_bbox_info({"width": value})
+
     def update_bbox_height(self, value):
         self.bbox_height_label.setText("bbox height=%d" % value)
         self.update_bbox()
+
+        self.update_bbox_info({"height": value})
 
     def update_slider(self, theta1, theta2):
         theta1 = theta1 / np.pi * 180
@@ -415,12 +514,78 @@ class CentralWidget(QWidget):
         height = self.bbox_height_slider.value()
         self.scene.update_bbox(width, height)
 
+    def one_step(self):
+        self.counter += 1
+
+        q_goal = self.q_goal.data.cpu().numpy().squeeze()
+        q_current = self.q_current.data.cpu().numpy().squeeze()
+        current_to_goal_dist = np.linalg.norm(q_goal - q_current)
+
+        if self.counter >= self.N or current_to_goal_dist < self.delta:
+            ratio = self.s / current_to_goal_dist
+            if ratio <= 1.0:
+                q_next = q_current + ratio * (q_goal - q_current)
+            else:
+                q_next = q_goal
+
+                self.counter = 0
+                self.timer.stop()
+                print("NPF exit!")
+
+            q_next = torch.tensor([q_next], dtype=torch.float32)
+            if use_gpu:
+                self.q_current.data = q_next.cuda()
+            else:
+                self.q_current.data = q_next
+
+        else:
+            self.optimizer.zero_grad()
+
+            if not self.vrep is None:
+                dist = nn.MSELoss(reduction="none")(torch.repeat_interleave(self.q_current, self.vrep.size(0), axis=0), self.vrep).sum(axis=1)
+                vrep_loss = (1.0 / (np.sqrt(2.0 * np.pi) * self.sigma) * torch.exp(-dist / (2.0 * self.sigma ** 2.0))).sum()
+            else:
+                vrep_loss = 0.0
+
+            tmp_tensor = torch.zeros_like(self.q_current.data)
+            tmp_tensor.copy_(self.q_current.data.detach())
+
+            goal_loss = self.mse(self.q_current, self.q_goal)
+
+            network_in = torch.cat([self.q_current, self.bbox_info], dim=-1)
+            prob = self.model(network_in)
+            obs_loss = self.xent(prob, self.target)
+            loss = self.xi * goal_loss + self.eta * obs_loss + self.zeta * vrep_loss
+            loss.backward()
+            self.optimizer.step()
+
+            self.q_prev.copy_(tmp_tensor)
+
+            q_current = self.q_current.data.cpu().numpy().squeeze()
+            q_goal = self.q_goal.data.cpu().numpy().squeeze()
+
+            current_to_goal_dist = np.linalg.norm(q_goal - q_current)
+            if current_to_goal_dist > self.delta:
+                grad_norm = np.linalg.norm(self.q_current.grad.cpu().numpy().squeeze())
+
+                if grad_norm < self.epsilon:
+                    if self.vrep is None:
+                        self.vrep = torch.tensor(self.q_prev)
+                    else:
+                        self.vrep = torch.cat([self.vrep, (self.q_prev + self.vrep[-1:]) / 2.0], dim=0)
+                    print("Local minima detected!")
+
+        theta1, theta2 = self.q_current.data.cpu().numpy().squeeze()
+        self.update_slider(theta1, theta2)
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, ckpt_path, use_gpu, min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height):
+    def __init__(self, ckpt_path, use_gpu, min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height,
+                 xi, eta, zeta, sigma, s, epsilon, delta, N, lr, momentum):
         super(MainWindow, self).__init__()
         self.view = CentralWidget(ckpt_path, use_gpu,
-                                  min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height)
+                                  min_bbox_width, max_bbox_width, min_bbox_height, max_bbox_height,
+                                  xi, eta, zeta, sigma, s, epsilon, delta, N, lr, momentum)
         self.setCentralWidget(self.view)
         self.statusBar().showMessage("Ready!")
 
@@ -441,6 +606,17 @@ if __name__ == '__main__':
     parser.add_argument("--max_bbox_width", type=float, default=40.0, help="The maximum width of the bbox.")
     parser.add_argument("--min_bbox_height", type=float, default=10.0, help="The minimum height of the bbox.")
     parser.add_argument("--max_bbox_height", type=float, default=40.0, help="The maximum height of the bbox.")
+    # NPF
+    parser.add_argument("--xi", type=float, default=1.0, help="Coefficient of the attractive field.")
+    parser.add_argument("--eta", type=float, default=1.0, help="Coefficient of the repulsive field.")
+    parser.add_argument("--zeta", type=float, default=1.0, help="Coefficient of the virtual repulsive field.")
+    parser.add_argument("--sigma", type=float, default=0.3, help="Scope of influence of the virtual repulsive field.")
+    parser.add_argument("--s", type=float, default=0.03, help="Motion to goal step size.")
+    parser.add_argument("--epsilon", type=float, default=5e-2, help="Threshold for detecting local minima.")
+    parser.add_argument("--delta", type=float, default=0.2, help="Threshold for detecting convergence.")
+    parser.add_argument("--N", type=float, default=1000, help="Maximum number of iterations.")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate of SGD optimizer.")
+    parser.add_argument("--momentum", type=float, default=0.7, help="Momentum of the SGD optimizer.")
     # Misc
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
 
@@ -474,7 +650,9 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
 
     mainwindow = MainWindow(args.ckpt, use_gpu,
-                            args.min_bbox_width, args.max_bbox_width, args.min_bbox_height, args.max_bbox_height)
+                            args.min_bbox_width, args.max_bbox_width, args.min_bbox_height, args.max_bbox_height,
+                            args.xi, args.eta, args.zeta, args.sigma, args.s, args.epsilon, args.delta, args.N,
+                            args.lr, args.momentum)
     mainwindow.setWindowTitle("Neural Potential Field Interactive Demo")
     mainwindow.resize(1280, 768)
     mainwindow.show()
